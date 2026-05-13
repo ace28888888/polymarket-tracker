@@ -15,11 +15,16 @@ if 'signals' not in st.session_state:
 if 'last_refresh' not in st.session_state:
     st.session_state.last_refresh = datetime.now()
 
-# ===== API =====
+# ===== API ENDPOINTS =====
+GAMMA_API = "https://gamma-api.polymarket.com"
+DATA_API = "https://data-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
+
+# ===== FETCH FUNCTIONS =====
 @st.cache_data(ttl=60)
-def get_polymarket_markets(limit=50, min_liquidity=1000):
-    """Fetch live markets from Polymarket Gamma API (free, no key)"""
-    url = "https://gamma-api.polymarket.com/markets"
+def get_gamma_markets(limit=100, min_liquidity=1000):
+    """Fetch market listings from Gamma API (free, no key)"""
+    url = f"{GAMMA_API}/markets"
     params = {
         "active": "true",
         "closed": "false",
@@ -32,20 +37,17 @@ def get_polymarket_markets(limit=50, min_liquidity=1000):
         r = requests.get(url, params=params, timeout=15)
         r.raise_for_status()
         data = r.json()
-        # Handle both list and dict with markets key
         if isinstance(data, dict):
-            markets = data.get("markets", data.get("data", []))
-        else:
-            markets = data
-        return markets if isinstance(markets, list) else []
+            return data.get("markets", data.get("data", []))
+        return data if isinstance(data, list) else []
     except Exception as e:
-        st.error(f"Polymarket API error: {e}")
+        st.sidebar.error(f"Gamma API: {e}")
         return []
 
 @st.cache_data(ttl=60)
-def get_market_orderbook(market_id):
-    """Fetch orderbook for a specific market"""
-    url = f"https://gamma-api.polymarket.com/markets/{market_id}/orderbook"
+def get_market_history(condition_id):
+    """Fetch price history from Data API"""
+    url = f"{DATA_API}/history/markets/{condition_id}"
     try:
         r = requests.get(url, timeout=10)
         r.raise_for_status()
@@ -53,33 +55,42 @@ def get_market_orderbook(market_id):
     except:
         return {}
 
-def parse_market(m):
-    """Normalize Polymarket market data"""
-    outcomes = m.get("outcomes", "Yes,No").split(",")
-    prices = m.get("outcomePrices", "0.5,0.5")
+@st.cache_data(ttl=60)
+def get_market_orderbook(condition_id):
+    """Fetch orderbook from CLOB API"""
+    url = f"{CLOB_API}/markets/{condition_id}/orderbook"
     try:
-        prices_list = [float(p) for p in prices.strip("[]").split(",")]
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except:
+        return {}
+
+# ===== PARSING =====
+def parse_market(m):
+    outcomes = m.get("outcomes", "Yes,No").split(",")
+    prices_raw = m.get("outcomePrices", "0.5,0.5")
+    try:
+        prices_list = [float(p) for p in prices_raw.strip("[]").split(",")]
     except:
         prices_list = [0.5, 0.5]
-
+    
     yes_price = prices_list[0] if len(prices_list) > 0 else 0.5
+    
     volume = m.get("volume24hr", m.get("volume", 0))
     if isinstance(volume, str):
-        try:
-            volume = float(volume)
-        except:
-            volume = 0
+        try: volume = float(volume)
+        except: volume = 0
+    
     liquidity = m.get("liquidity", m.get("liquidityNum", 0))
     if isinstance(liquidity, str):
-        try:
-            liquidity = float(liquidity)
-        except:
-            liquidity = 0
-
+        try: liquidity = float(liquidity)
+        except: liquidity = 0
+    
     return {
-        "id": m.get("conditionId", m.get("id", "")),
+        "condition_id": m.get("conditionId", m.get("id", "")),
         "slug": m.get("slug", ""),
-        "title": m.get("question", m.get("title", "Unknown Market")),
+        "title": m.get("question", m.get("title", "Unknown")),
         "category": m.get("category", "General"),
         "yes_price": yes_price,
         "no_price": 1 - yes_price,
@@ -90,124 +101,147 @@ def parse_market(m):
         "spread": abs(prices_list[0] - prices_list[1]) if len(prices_list) > 1 else 0,
     }
 
+def calc_edge(m):
+    """Edge = uncertainty × liquidity. Higher = better opportunity."""
+    price_uncertainty = 1 - abs(m["yes_price"] - 0.5) * 2  # 0 = certain, 1 = 50/50
+    liquidity_score = min(m["liquidity"] / 50000, 1.0)  # cap at $50k
+    volume_score = min(m["volume_24h"] / 100000, 1.0)  # cap at $100k vol
+    return (price_uncertainty * 5) + (liquidity_score * 3) + (volume_score * 2)
+
 # ===== SIDEBAR =====
 with st.sidebar:
     st.header("🎯 Settings")
     bankroll = st.number_input("Bankroll ($)", 1000, 10000000, 10000, 1000)
-    threshold = st.slider("Alert Threshold (score)", 5.0, 10.0, 7.0, 0.5)
-    min_volume = st.number_input("Min Volume 24h ($)", 1000, 10000000, 10000, 1000)
+    min_volume = st.number_input("Min 24h Volume ($)", 1000, 10000000, 10000, 1000)
+    min_liquidity = st.number_input("Min Liquidity ($)", 1000, 10000000, 5000, 1000)
+    edge_threshold = st.slider("Edge Threshold", 5.0, 10.0, 7.0, 0.5)
     st.divider()
-    st.subheader("📡 Data Sources")
-    st.checkbox("Polymarket (LIVE)", value=True, disabled=True)
-    st.checkbox("Kalshi", value=False, disabled=True)
-    st.caption("Polymarket = free reads, no API key")
-    if st.button("🔄 Refresh Data"):
+    st.subheader("📡 APIs")
+    st.markdown("✅ Gamma (markets)")
+    st.markdown("✅ Data (history)")
+    st.markdown("✅ CLOB (orderbook)")
+    st.caption("All free, no keys needed for reads")
+    if st.button("🔄 Refresh"):
         st.cache_data.clear()
         st.rerun()
 
 # ===== HEADER =====
 st.title("🎯 Polymarket Live Tracker")
-st.caption("Real prediction markets. Real edge. Updated every 60s.")
+st.caption("Gamma + Data + CLOB APIs. Real markets. Real edge.")
 st.divider()
 
-# ===== FETCH DATA =====
-with st.spinner("Pulling live Polymarket data..."):
-    raw_markets = get_polymarket_markets(limit=100, min_liquidity=1000)
-    markets = [parse_market(m) for m in raw_markets]
-    # Filter by min volume
+# ===== FETCH =====
+with st.spinner("Pulling from 3 Polymarket APIs..."):
+    raw = get_gamma_markets(limit=100, min_liquidity=min_liquidity)
+    markets = [parse_market(m) for m in raw]
     markets = [m for m in markets if m["volume_24h"] >= min_volume]
+    
+    # Calculate edge for all
+    for m in markets:
+        m["edge"] = calc_edge(m)
+    
+    # Fetch orderbook for top 20 by volume
+    for m in markets[:20]:
+        ob = get_market_orderbook(m["condition_id"])
+        m["orderbook"] = ob
+        # Best bid/ask spread
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+        if bids and asks:
+            best_bid = float(bids[0]["price"]) if isinstance(bids[0], dict) else float(bids[0][0])
+            best_ask = float(asks[0]["price"]) if isinstance(asks[0], dict) else float(asks[0][0])
+            m["spread_bps"] = abs(best_ask - best_bid) * 10000
+        else:
+            m["spread_bps"] = None
 
 if not markets:
-    st.warning("No markets loaded. Polymarket API may be rate-limited. Click Refresh to retry.")
+    st.warning("No markets loaded. API may be rate-limited. Click Refresh.")
     st.stop()
 
 # ===== KPIs =====
 total_vol = sum(m["volume_24h"] for m in markets)
-high_conf = len([m for m in markets if m["yes_price"] > 0.7 or m["yes_price"] < 0.3])
-avg_price = sum(m["yes_price"] for m in markets) / len(markets) if markets else 0.5
+high_edge = len([m for m in markets if m["edge"] >= edge_threshold])
+active_markets = len(markets)
+avg_liq = sum(m["liquidity"] for m in markets) / len(markets)
 
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Markets Tracked", len(markets))
+k1.metric("Markets", active_markets)
 k2.metric("24h Volume", f"${total_vol:,.0f}")
-k3.metric("High Confidence", high_conf, delta=">70% or <30%")
-k4.metric("Avg Yes Price", f"{avg_price:.1%}")
+k3.metric("High Edge", high_edge, delta=">7.0")
+k4.metric("Avg Liquidity", f"${avg_liq:,.0f}")
 st.divider()
 
 # ===== TABS =====
-tab1, tab2, tab3 = st.tabs(["🔥 Live Markets", "📊 Opportunities", "🎯 Targets"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔥 Live Markets", "⚡ Opportunities", "🎯 Targets", "📊 Market Detail"])
 
 # ===== TAB 1: LIVE MARKETS =====
 with tab1:
-    st.subheader("Active Polymarket Markets")
-    search = st.text_input("Filter markets...", placeholder="e.g. trump, election, elon...")
+    st.subheader("All Active Markets")
+    search = st.text_input("Filter...", placeholder="trump, crypto, election...")
     
     df = pd.DataFrame(markets)
     if search:
         df = df[df["title"].str.lower().str.contains(search.lower(), na=False)]
-    
-    # Sort by volume
     df = df.sort_values("volume_24h", ascending=False)
     
-    for _, m in df.head(20).iterrows():
-        c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+    for _, m in df.head(25).iterrows():
+        c1, c2, c3, c4, c5 = st.columns([3, 1, 1, 1, 1])
         with c1:
             st.markdown(f"**{m['title']}**")
-            st.caption(f"{m['category']} | Ends: {str(m['end_date'])[:10]}")
+            st.caption(f"{m['category']} | Ends {str(m['end_date'])[:10]}")
         with c2:
             st.metric("Yes", f"{m['yes_price']:.1%}")
         with c3:
-            st.metric("24h Vol", f"${m['volume_24h']:,.0f}")
+            st.metric("Vol 24h", f"${m['volume_24h']:,.0f}")
         with c4:
-            # Edge score = inverse of confidence (lower confidence = higher edge if you have info)
-            edge = 10 - abs(m['yes_price'] - 0.5) * 10
-            st.metric("Edge", f"{edge:.1f}")
-            if edge >= threshold:
-                st.success("🔥 Signal")
-            elif m['volume_24h'] > 100000:
-                st.info("📈 Volume")
+            st.metric("Liquidity", f"${m['liquidity']:,.0f}")
+        with c5:
+            st.metric("Edge", f"{m['edge']:.1f}")
+            if m["edge"] >= edge_threshold:
+                st.success("🔥")
         st.divider()
 
 # ===== TAB 2: OPPORTUNITIES =====
 with tab2:
     st.subheader("Asymmetric Opportunities")
-    st.caption("Markets with high volume but uncertain pricing (edge > 7)")
+    st.caption(f"Edge ≥ {edge_threshold}, decent volume. These have uncertainty + liquidity.")
     
-    opportunities = [m for m in markets if (10 - abs(m["yes_price"] - 0.5) * 10) >= threshold and m["volume_24h"] > 50000]
-    opportunities.sort(key=lambda x: x["volume_24h"], reverse=True)
+    opps = [m for m in markets if m["edge"] >= edge_threshold and m["volume_24h"] > 10000]
+    opps.sort(key=lambda x: x["edge"], reverse=True)
     
-    if not opportunities:
-        st.info("No high-edge opportunities right now. Lower the threshold or check back later.")
+    if not opps:
+        st.info("No high-edge markets right now. Lower threshold or check later.")
     
-    for m in opportunities[:10]:
-        edge = 10 - abs(m["yes_price"] - 0.5) * 10
-        pos = (bankroll * 0.02) * (edge / 10)
+    for m in opps[:15]:
+        pos = (bankroll * 0.02) * (m["edge"] / 10)
+        spread_info = f"Spread: {m['spread_bps']:.0f} bps" if m.get('spread_bps') else ""
         
-        with st.container():
-            c1, c2, c3 = st.columns([1, 3, 1])
-            with c1:
-                emoji = "🔥" if edge >= 9 else "⚡" if edge >= 7 else "📊"
-                st.markdown(f"## {emoji}")
-                st.markdown(f"**{edge:.1f}/10**")
-            with c2:
-                st.markdown(f"**{m['title']}**")
-                st.caption(f"Yes: {m['yes_price']:.1%} | Vol: ${m['volume_24h']:,.0f} | Liq: ${m['liquidity']:,.0f}")
-            with c3:
-                st.markdown(f"**${pos:,.0f}** suggested")
-                st.markdown(f"[View on Polymarket](https://polymarket.com/event/{m['slug']})")
-            st.divider()
+        c1, c2, c3 = st.columns([1, 3, 1])
+        with c1:
+            emoji = "🔥" if m["edge"] >= 9 else "⚡" if m["edge"] >= 7 else "📊"
+            st.markdown(f"## {emoji}")
+            st.markdown(f"**{m['edge']:.1f}/10**")
+        with c2:
+            st.markdown(f"**{m['title']}**")
+            st.caption(f"Yes: {m['yes_price']:.1%} | Vol: ${m['volume_24h']:,.0f} | Liq: ${m['liquidity']:,.0f}")
+            if spread_info:
+                st.caption(spread_info)
+        with c3:
+            st.markdown(f"**${pos:,.0f}** suggested")
+            st.markdown(f"[Trade](https://polymarket.com/event/{m['slug']})")
+        st.divider()
 
 # ===== TAB 3: TARGETS =====
 with tab3:
-    st.subheader("Celebrity & Political Targets")
+    st.subheader("Track by Category")
     
-    # Keywords to track
     TARGETS = {
-        "Trump": ["trump", "donald trump", "realDonaldTrump"],
-        "Elon": ["elon", "musk", "tesla", "spacex", "dogecoin"],
-        "Biden": ["biden", "joe biden"],
-        "Crypto": ["bitcoin", "ethereum", "btc", "eth", "crypto"],
-        "Election 2024": ["election", "president", "vote"],
-        "Sports": ["super bowl", "world cup", "olympics", "nba"],
+        "Trump / Politics": ["trump", "donald", "election", "president", "vote", "biden", "kamala", "gop", "democrat"],
+        "Elon / Tesla / Crypto": ["elon", "musk", "tesla", "spacex", "dogecoin", "doge", "bitcoin", "btc", "ethereum", "crypto"],
+        "Sports": ["super bowl", "world cup", "olympics", "nba", "nfl", "ufc", "boxing"],
+        "Pop Culture": ["taylor swift", "kanye", "kim kardashian", "celebrity", "oscar", "grammy", "album"],
+        "Geopolitics": ["ukraine", "russia", "israel", "china", "war", "nato", "putin", "zelensky"],
+        "Finance / Macro": ["fed", "inflation", "recession", "interest rate", "gdp", "unemployment", "sp500"],
     }
     
     for target_name, keywords in TARGETS.items():
@@ -216,13 +250,65 @@ with tab3:
         
         if matches:
             with st.expander(f"🎯 {target_name} — {len(matches)} markets"):
-                for m in matches[:5]:
-                    edge = 10 - abs(m["yes_price"] - 0.5) * 10
-                    st.markdown(f"**{m['title']}** — Yes: {m['yes_price']:.1%} | Vol: ${m['volume_24h']:,.0f} | Edge: {edge:.1f}")
-                    st.caption(f"[Trade now](https://polymarket.com/event/{m['slug']})")
+                for m in matches[:7]:
+                    st.markdown(f"**{m['title']}** — Yes: {m['yes_price']:.1%} | Vol: ${m['volume_24h']:,.0f} | Edge: {m['edge']:.1f}")
+                    st.caption(f"[Trade](https://polymarket.com/event/{m['slug']})")
         else:
             st.caption(f"🎯 {target_name} — no active markets")
 
+# ===== TAB 4: MARKET DETAIL =====
+with tab4:
+    st.subheader("Deep Dive")
+    if not markets:
+        st.warning("No markets loaded")
+    else:
+        market_titles = [m["title"] for m in markets]
+        selected = st.selectbox("Pick a market", market_titles)
+        m = next((m for m in markets if m["title"] == selected), None)
+        
+        if m:
+            st.markdown(f"## {m['title']}")
+            
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Yes Price", f"{m['yes_price']:.2%}")
+            c2.metric("24h Volume", f"${m['volume_24h']:,.0f}")
+            c3.metric("Liquidity", f"${m['liquidity']:,.0f}")
+            c4.metric("Edge Score", f"{m['edge']:.1f}")
+            
+            st.divider()
+            
+            # Show orderbook if we have it
+            ob = m.get("orderbook", {})
+            if ob:
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.subheader("Bids")
+                    bids = ob.get("bids", [])[:10]
+                    if bids:
+                        for b in bids:
+                            if isinstance(b, dict):
+                                st.text(f"${b.get('price', 0):.3f} × {b.get('size', 0):,.0f}")
+                            else:
+                                st.text(str(b))
+                    else:
+                        st.caption("No bids")
+                
+                with col_b:
+                    st.subheader("Asks")
+                    asks = ob.get("asks", [])[:10]
+                    if asks:
+                        for a in asks:
+                            if isinstance(a, dict):
+                                st.text(f"${a.get('price', 0):.3f} × {a.get('size', 0):,.0f}")
+                            else:
+                                st.text(str(a))
+                    else:
+                        st.caption("No asks")
+            else:
+                st.caption("Orderbook not available for this market")
+            
+            st.markdown(f"[🔗 Trade on Polymarket](https://polymarket.com/event/{m['slug']})")
+
 # ===== FOOTER =====
 st.divider()
-st.caption(f"Last refreshed: {st.session_state.last_refresh.strftime('%Y-%m-%d %H:%M:%S UTC')} | Data: Polymarket Gamma API")
+st.caption(f"Last refresh: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} | Gamma + Data + CLOB APIs")

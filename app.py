@@ -1,138 +1,228 @@
 import streamlit as st
 import pandas as pd
+import requests
 from datetime import datetime
 
-# Page config
 st.set_page_config(
-    page_title="Celebrity Prediction Market Tracker",
+    page_title="Polymarket Tracker",
     page_icon="🎯",
     layout="wide"
 )
 
-# Initialize session state
+# ===== SESSION STATE =====
 if 'signals' not in st.session_state:
     st.session_state.signals = []
 if 'last_refresh' not in st.session_state:
     st.session_state.last_refresh = datetime.now()
 
-# ===== DATA =====
-CELEBRITY_TARGETS = {
-    "Elon Musk": {"handle": "@elonmusk", "category": "Tech CEO", "followers": "180M", "reliability": 10, "status": "active", "win_rate": 0.85},
-    "Donald Trump": {"handle": "@realDonaldTrump", "category": "Politics", "followers": "87M", "reliability": 9, "status": "hot", "win_rate": 0.82},
-    "Andrew Tate": {"handle": "@Cobratate", "category": "Influencer", "followers": "9M", "reliability": 9, "status": "hot", "win_rate": 0.79},
-    "KSI": {"handle": "@KSI", "category": "Creator/Boxer", "followers": "12M", "reliability": 9, "status": "active", "win_rate": 0.84},
-    "Jake Paul": {"handle": "@jakepaul", "category": "Boxer/Creator", "followers": "20M", "reliability": 8, "status": "watching", "win_rate": 0.73},
-    "MrBeast": {"handle": "@MrBeast", "category": "Creator", "followers": "300M", "reliability": 8, "status": "active", "win_rate": 0.81},
-    "Kim Kardashian": {"handle": "@KimKardashian", "category": "Celebrity", "followers": "360M", "reliability": 7, "status": "watching", "win_rate": 0.68},
-    "Kanye West": {"handle": "@kanyewest", "category": "Music", "followers": "32M", "reliability": 8, "status": "hot", "win_rate": 0.71}
-}
+# ===== API =====
+@st.cache_data(ttl=60)
+def get_polymarket_markets(limit=50, min_liquidity=1000):
+    """Fetch live markets from Polymarket Gamma API (free, no key)"""
+    url = "https://gamma-api.polymarket.com/markets"
+    params = {
+        "active": "true",
+        "closed": "false",
+        "liquidityNumMin": min_liquidity,
+        "limit": limit,
+        "sort": "volume24hr",
+        "ascending": "false"
+    }
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        # Handle both list and dict with markets key
+        if isinstance(data, dict):
+            markets = data.get("markets", data.get("data", []))
+        else:
+            markets = data
+        return markets if isinstance(markets, list) else []
+    except Exception as e:
+        st.error(f"Polymarket API error: {e}")
+        return []
 
-MARKETS = [
-    {"title": "Will Elon tweet about Dogecoin this week?", "target": "Elon Musk", "platform": "Polymarket", "volume": 145000, "yes": 0.72, "score": 8.5, "signal": True},
-    {"title": "Will Trump mention election fraud in next speech?", "target": "Donald Trump", "platform": "Polymarket", "volume": 89000, "yes": 0.81, "score": 9.2, "signal": True},
-    {"title": "Will Tate be banned from X in January?", "target": "Andrew Tate", "platform": "Kalshi", "volume": 45000, "yes": 0.34, "score": 7.8, "signal": True},
-    {"title": "Will KSI announce boxing opponent by Feb 1?", "target": "KSI", "platform": "Polymarket", "volume": 67000, "yes": 0.58, "score": 7.5, "signal": False},
-    {"title": "Will MrBeast reach 300M subs by March?", "target": "MrBeast", "platform": "Polymarket", "volume": 120000, "yes": 0.89, "score": 8.1, "signal": False}
-]
+@st.cache_data(ttl=60)
+def get_market_orderbook(market_id):
+    """Fetch orderbook for a specific market"""
+    url = f"https://gamma-api.polymarket.com/markets/{market_id}/orderbook"
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except:
+        return {}
 
-# ===== FUNCTIONS =====
-def get_emoji(score):
-    if score >= 9: return "🔥"
-    elif score >= 7: return "⚡"
-    elif score >= 5: return "📊"
-    else: return "💤"
+def parse_market(m):
+    """Normalize Polymarket market data"""
+    outcomes = m.get("outcomes", "Yes,No").split(",")
+    prices = m.get("outcomePrices", "0.5,0.5")
+    try:
+        prices_list = [float(p) for p in prices.strip("[]").split(",")]
+    except:
+        prices_list = [0.5, 0.5]
 
-def calc_position(confidence, bankroll):
-    return (bankroll * 0.02) * (confidence / 10)
+    yes_price = prices_list[0] if len(prices_list) > 0 else 0.5
+    volume = m.get("volume24hr", m.get("volume", 0))
+    if isinstance(volume, str):
+        try:
+            volume = float(volume)
+        except:
+            volume = 0
+    liquidity = m.get("liquidity", m.get("liquidityNum", 0))
+    if isinstance(liquidity, str):
+        try:
+            liquidity = float(liquidity)
+        except:
+            liquidity = 0
+
+    return {
+        "id": m.get("conditionId", m.get("id", "")),
+        "slug": m.get("slug", ""),
+        "title": m.get("question", m.get("title", "Unknown Market")),
+        "category": m.get("category", "General"),
+        "yes_price": yes_price,
+        "no_price": 1 - yes_price,
+        "volume_24h": volume,
+        "liquidity": liquidity,
+        "end_date": m.get("resolutionTime", m.get("endDate", "N/A")),
+        "volume_total": m.get("volume", volume),
+        "spread": abs(prices_list[0] - prices_list[1]) if len(prices_list) > 1 else 0,
+    }
 
 # ===== SIDEBAR =====
 with st.sidebar:
     st.header("🎯 Settings")
-    bankroll = st.number_input("Bankroll ($)", 1000, 1000000, 10000, 1000)
-    threshold = st.slider("Alert Threshold", 5.0, 10.0, 7.0, 0.5)
+    bankroll = st.number_input("Bankroll ($)", 1000, 10000000, 10000, 1000)
+    threshold = st.slider("Alert Threshold (score)", 5.0, 10.0, 7.0, 0.5)
+    min_volume = st.number_input("Min Volume 24h ($)", 1000, 10000000, 10000, 1000)
     st.divider()
-    st.subheader("📡 APIs")
-    st.checkbox("Twitter/X", value=False)
-    st.checkbox("Polymarket", value=True)
-    st.checkbox("Kalshi", value=True)
+    st.subheader("📡 Data Sources")
+    st.checkbox("Polymarket (LIVE)", value=True, disabled=True)
+    st.checkbox("Kalshi", value=False, disabled=True)
+    st.caption("Polymarket = free reads, no API key")
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
 
 # ===== HEADER =====
-st.title("🎯 Celebrity Prediction Market Tracker")
-st.caption("Find asymmetric opportunities before the market catches on")
+st.title("🎯 Polymarket Live Tracker")
+st.caption("Real prediction markets. Real edge. Updated every 60s.")
 st.divider()
 
-# KPIs
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Active Signals", "3", "+1 today")
-col2.metric("High Confidence (>8)", "2", "🔥 Hot")
-col3.metric("Markets Available", "5", "2 match signals")
-col4.metric("Est. Edge", "15-25%", "vs. retail")
+# ===== FETCH DATA =====
+with st.spinner("Pulling live Polymarket data..."):
+    raw_markets = get_polymarket_markets(limit=100, min_liquidity=1000)
+    markets = [parse_market(m) for m in raw_markets]
+    # Filter by min volume
+    markets = [m for m in markets if m["volume_24h"] >= min_volume]
+
+if not markets:
+    st.warning("No markets loaded. Polymarket API may be rate-limited. Click Refresh to retry.")
+    st.stop()
+
+# ===== KPIs =====
+total_vol = sum(m["volume_24h"] for m in markets)
+high_conf = len([m for m in markets if m["yes_price"] > 0.7 or m["yes_price"] < 0.3])
+avg_price = sum(m["yes_price"] for m in markets) / len(markets) if markets else 0.5
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Markets Tracked", len(markets))
+k2.metric("24h Volume", f"${total_vol:,.0f}")
+k3.metric("High Confidence", high_conf, delta=">70% or <30%")
+k4.metric("Avg Yes Price", f"{avg_price:.1%}")
 st.divider()
 
-# Tabs
-tab1, tab2, tab3 = st.tabs(["🔥 Live Signals", "📊 Markets", "🎯 Targets"])
+# ===== TABS =====
+tab1, tab2, tab3 = st.tabs(["🔥 Live Markets", "📊 Opportunities", "🎯 Targets"])
 
-# ===== TAB 1: SIGNALS =====
+# ===== TAB 1: LIVE MARKETS =====
 with tab1:
-    st.subheader("High-Priority Signals")
+    st.subheader("Active Polymarket Markets")
+    search = st.text_input("Filter markets...", placeholder="e.g. trump, election, elon...")
     
-    signals = [
-        {"time": "14:32", "target": "Donald Trump", "platform": "Truth Social",
-         "text": "WITCH HUNT CONTINUES! THEY WON'T STOP UNTIL THEY DESTROY AMERICA! BIG NEWS COMING...",
-         "score": 9.2, "timeframe": "24-48h", "market_ready": True},
-        {"time": "09:15", "target": "Andrew Tate", "platform": "X",
-         "text": "The Matrix is closing in. They fear the truth. Soon everyone will see.",
-         "score": 8.5, "timeframe": "24-72h", "market_ready": True},
-        {"time": "22:45", "target": "Kanye West", "platform": "X",
-         "text": "...", "score": 6.8, "timeframe": "12-24h", "market_ready": False}
-    ]
+    df = pd.DataFrame(markets)
+    if search:
+        df = df[df["title"].str.lower().str.contains(search.lower(), na=False)]
     
-    for sig in signals:
-        if sig["score"] >= threshold:
-            with st.container():
-                c1, c2, c3 = st.columns([1, 3, 1])
-                with c1:
-                    st.markdown(f"## {get_emoji(sig['score'])}")
-                    st.markdown(f"**{sig['score']}/10**")
-                with c2:
-                    st.markdown(f"**{sig['target']}** - {sig['platform']} at {sig['time']}")
-                    st.markdown(f"_{sig['text'][:60]}..._ ⏱️ **{sig['timeframe']}**")
-                with c3:
-                    pos = calc_position(sig['score'], bankroll)
-                    st.markdown(f"**${pos:,.0f}**")
-                    if sig["market_ready"]:
-                        st.success("Market Live")
-                    else:
-                        st.info("Wait")
-                st.divider()
-
-# ===== TAB 2: MARKETS =====
-with tab2:
-    st.subheader("Active Markets")
-    for m in MARKETS:
-        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    # Sort by volume
+    df = df.sort_values("volume_24h", ascending=False)
+    
+    for _, m in df.head(20).iterrows():
+        c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
         with c1:
             st.markdown(f"**{m['title']}**")
-            st.caption(f"{m['target']} | {m['platform']}")
+            st.caption(f"{m['category']} | Ends: {str(m['end_date'])[:10]}")
         with c2:
-            st.metric("Volume", f"${m['volume']:,}")
+            st.metric("Yes", f"{m['yes_price']:.1%}")
         with c3:
-            st.metric("Yes %", f"{m['yes']:.0%}")
+            st.metric("24h Vol", f"${m['volume_24h']:,.0f}")
         with c4:
-            st.metric("Score", f"{m['score']}/10")
-            if m['signal']:
+            # Edge score = inverse of confidence (lower confidence = higher edge if you have info)
+            edge = 10 - abs(m['yes_price'] - 0.5) * 10
+            st.metric("Edge", f"{edge:.1f}")
+            if edge >= threshold:
                 st.success("🔥 Signal")
+            elif m['volume_24h'] > 100000:
+                st.info("📈 Volume")
         st.divider()
+
+# ===== TAB 2: OPPORTUNITIES =====
+with tab2:
+    st.subheader("Asymmetric Opportunities")
+    st.caption("Markets with high volume but uncertain pricing (edge > 7)")
+    
+    opportunities = [m for m in markets if (10 - abs(m["yes_price"] - 0.5) * 10) >= threshold and m["volume_24h"] > 50000]
+    opportunities.sort(key=lambda x: x["volume_24h"], reverse=True)
+    
+    if not opportunities:
+        st.info("No high-edge opportunities right now. Lower the threshold or check back later.")
+    
+    for m in opportunities[:10]:
+        edge = 10 - abs(m["yes_price"] - 0.5) * 10
+        pos = (bankroll * 0.02) * (edge / 10)
+        
+        with st.container():
+            c1, c2, c3 = st.columns([1, 3, 1])
+            with c1:
+                emoji = "🔥" if edge >= 9 else "⚡" if edge >= 7 else "📊"
+                st.markdown(f"## {emoji}")
+                st.markdown(f"**{edge:.1f}/10**")
+            with c2:
+                st.markdown(f"**{m['title']}**")
+                st.caption(f"Yes: {m['yes_price']:.1%} | Vol: ${m['volume_24h']:,.0f} | Liq: ${m['liquidity']:,.0f}")
+            with c3:
+                st.markdown(f"**${pos:,.0f}** suggested")
+                st.markdown(f"[View on Polymarket](https://polymarket.com/event/{m['slug']})")
+            st.divider()
 
 # ===== TAB 3: TARGETS =====
 with tab3:
-    st.subheader("Celebrity Database")
+    st.subheader("Celebrity & Political Targets")
     
-    cols = st.columns(4)
-    for i, (name, data) in enumerate(CELEBRITY_TARGETS.items()):
-        with cols[i % 4]:
-            status_color = "🟢" if data['status'] == 'active' else "🔴" if data['status'] == 'hot' else "⚪"
-            st.markdown(f"**{name}** {status_color}")
-            st.caption(f"{data['category']} | {data['followers']} followers")
-            st.caption(f"Reliability: {data['reliability']}/10 | Win rate: {data['win_rate']:.0%}")
-            st.divider()
+    # Keywords to track
+    TARGETS = {
+        "Trump": ["trump", "donald trump", "realDonaldTrump"],
+        "Elon": ["elon", "musk", "tesla", "spacex", "dogecoin"],
+        "Biden": ["biden", "joe biden"],
+        "Crypto": ["bitcoin", "ethereum", "btc", "eth", "crypto"],
+        "Election 2024": ["election", "president", "vote"],
+        "Sports": ["super bowl", "world cup", "olympics", "nba"],
+    }
+    
+    for target_name, keywords in TARGETS.items():
+        matches = [m for m in markets if any(kw in m["title"].lower() for kw in keywords)]
+        matches.sort(key=lambda x: x["volume_24h"], reverse=True)
+        
+        if matches:
+            with st.expander(f"🎯 {target_name} — {len(matches)} markets"):
+                for m in matches[:5]:
+                    edge = 10 - abs(m["yes_price"] - 0.5) * 10
+                    st.markdown(f"**{m['title']}** — Yes: {m['yes_price']:.1%} | Vol: ${m['volume_24h']:,.0f} | Edge: {edge:.1f}")
+                    st.caption(f"[Trade now](https://polymarket.com/event/{m['slug']})")
+        else:
+            st.caption(f"🎯 {target_name} — no active markets")
+
+# ===== FOOTER =====
+st.divider()
+st.caption(f"Last refreshed: {st.session_state.last_refresh.strftime('%Y-%m-%d %H:%M:%S UTC')} | Data: Polymarket Gamma API")

@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timedelta
 
 st.set_page_config(
-    page_title="Polymarket Tracker — Trump & Elon Alpha",
+    page_title="Polymarket Tracker — Combined Signal Alpha",
     page_icon="🎯",
     layout="wide"
 )
@@ -22,14 +22,13 @@ DATA_API = "https://data-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 NEWS_API = "https://newsapi.org/v2"
 
-# Try to load NewsAPI key from secrets
 NEWS_API_KEY = None
 try:
     NEWS_API_KEY = st.secrets.get("newsapi_key", None)
 except:
     pass
 
-# ===== PERSONALITY PROFILES (Astrology + Behavioral) =====
+# ===== PERSONALITY PROFILES =====
 PERSONALITIES = {
     "Trump": {
         "name": "Donald Trump",
@@ -139,29 +138,15 @@ def get_gamma_markets(limit=200, min_liquidity=500):
         st.sidebar.error(f"Gamma API: {e}")
         return []
 
-@st.cache_data(ttl=300)
-def get_market_history(condition_id):
-    url = f"{DATA_API}/history/markets/{condition_id}"
-    try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except:
-        return {}
-
 @st.cache_data(ttl=600)
 def get_news(query, api_key=None, page_size=20):
-    """Fetch news from NewsAPI (free tier: 100 req/day)"""
     if not api_key:
-        # Try to get from secrets
         try:
             api_key = st.secrets.get("newsapi_key", None)
         except:
             pass
-    
     if not api_key:
-        return {"error": "No NewsAPI key. Add to Render Environment Variables as 'newsapi_key'. Free key at newsapi.org"}
-    
+        return {"error": "No NewsAPI key"}
     url = f"{NEWS_API}/everything"
     params = {
         "q": query,
@@ -185,24 +170,19 @@ def parse_market(m):
         prices_list = [float(p) for p in prices_raw.strip("[]").split(",")]
     except:
         prices_list = [0.5, 0.5]
-    
     yes_price = prices_list[0] if len(prices_list) > 0 else 0.5
-    
     volume = m.get("volume24hr", m.get("volume", 0))
     if isinstance(volume, str):
         try: volume = float(volume)
         except: volume = 0
-    
     liquidity = m.get("liquidity", m.get("liquidityNum", 0))
     if isinstance(liquidity, str):
         try: liquidity = float(liquidity)
         except: liquidity = 0
-    
     vol_total = m.get("volume", volume)
     if isinstance(vol_total, str):
         try: vol_total = float(vol_total)
         except: vol_total = volume
-    
     return {
         "condition_id": m.get("conditionId", m.get("id", "")),
         "slug": m.get("slug", ""),
@@ -217,19 +197,17 @@ def parse_market(m):
         "spread": abs(prices_list[0] - prices_list[1]) if len(prices_list) > 1 else 0,
     }
 
+# ===== FRAMEWORK 1: MARKET DATA =====
 def calc_hot_score(m):
     vol_24h = m["volume_24h"]
     vol_total = m["volume_total"]
     liquidity = m["liquidity"]
     yes_price = m["yes_price"]
-    
     velocity = (vol_24h / max(vol_total, 1)) * 10
     uncertainty = 1 - abs(yes_price - 0.5) * 2
     liq_score = min(liquidity / 50000, 1.0)
     raw_vol = min(vol_24h / 100000, 1.0)
-    
-    hot_score = (velocity * 3) + (uncertainty * 2.5) + (liq_score * 2) + (raw_vol * 2.5)
-    return hot_score
+    return (velocity * 3) + (uncertainty * 2.5) + (liq_score * 2) + (raw_vol * 2.5)
 
 def calc_big_play_score(m):
     uncertainty = 1 - abs(m["yes_price"] - 0.5) * 2
@@ -237,12 +215,19 @@ def calc_big_play_score(m):
     vol_score = min(m["volume_24h"] / 50000, 1.0)
     return (uncertainty * 4) + (liq_score * 3) + (vol_score * 3)
 
-# ===== TWEET ANALYZER =====
+def market_framework_score(m):
+    """Framework 1: Market Data (40% weight in combined)"""
+    hot = calc_hot_score(m)
+    big = calc_big_play_score(m)
+    # Normalize to 0-100
+    hot_norm = min(hot / 10 * 100, 100)
+    big_norm = min(big / 10 * 100, 100)
+    return (hot_norm * 0.6) + (big_norm * 0.4)
+
+# ===== FRAMEWORK 2: PERSONALITY/BEHAVIORAL =====
 def analyze_tweet(tweet_text, personality="Trump"):
-    """Analyze tweet using personality profile + behavioral gauge"""
     p = PERSONALITIES[personality]
     text_lower = tweet_text.lower()
-    
     scores = {
         "energy_level": "normal",
         "caps_ratio": 0,
@@ -255,48 +240,32 @@ def analyze_tweet(tweet_text, personality="Trump"):
         "predicted_market_impact": "low",
         "confidence": 0
     }
-    
-    # Energy analysis
     words = tweet_text.split()
     caps_words = [w for w in words if w.isupper() and len(w) > 1]
     scores["caps_ratio"] = len(caps_words) / max(len(words), 1)
-    
     if scores["caps_ratio"] > 0.3:
         scores["energy_level"] = "high_energy"
     if scores["caps_ratio"] > 0.6:
         scores["energy_level"] = "manic"
-    
-    # Pattern matching
-    # Nicknames (Trump)
     nickname_pattern = r'\b(sleepy|crooked|little|lyin|crazy|nasty|shifty|mini)\s+\w+\b'
     if re.search(nickname_pattern, text_lower):
         scores["has_nickname"] = True
         scores["behavioral_match"].append("Uses derogatory nickname")
-    
-    # Deadlines
     deadline_pattern = r'\b(coming soon|big news|announcement|in \d+ (days?|weeks?)|next week|tomorrow)\b'
     if re.search(deadline_pattern, text_lower):
         scores["has_deadline"] = True
         scores["behavioral_match"].append("Sets arbitrary deadline/expectation")
-    
-    # Meme indicators (Elon)
     meme_indicators = ['lol', '😂', 'meme', 'haha', 'lmao', 'bruh']
     if any(m in text_lower for m in meme_indicators):
         scores["has_meme"] = True
         scores["behavioral_match"].append("Uses humor/memes (deflection)")
-    
-    # Crypto mentions (Elon)
     crypto_words = ['doge', 'bitcoin', 'btc', 'crypto', 'ethereum', 'eth', 'coin']
     if any(c in text_lower for c in crypto_words):
         scores["has_crypto"] = True
         scores["behavioral_match"].append("Mentions cryptocurrency")
-    
-    # Market triggers
     for trigger in p["market_triggers"]:
         if trigger in text_lower:
             scores["mentions_market_trigger"].append(trigger)
-    
-    # Predict impact
     trigger_count = len(scores["mentions_market_trigger"])
     if scores["energy_level"] == "manic" and trigger_count > 0:
         scores["predicted_market_impact"] = "very_high"
@@ -313,8 +282,171 @@ def analyze_tweet(tweet_text, personality="Trump"):
     else:
         scores["predicted_market_impact"] = "low"
         scores["confidence"] = 25
-    
     return scores
+
+def personality_framework_score(tweet_analysis=None, personality="Trump", market_title=""):
+    """Framework 2: Personality/Behavioral (30% weight in combined)"""
+    if not tweet_analysis:
+        return 50  # Neutral if no tweet data
+    
+    impact_scores = {"low": 30, "medium": 55, "high": 75, "very_high": 90}
+    base = impact_scores.get(tweet_analysis["predicted_market_impact"], 50)
+    confidence_boost = tweet_analysis["confidence"] / 100 * 10
+    
+    # Check if market is actually related to triggers
+    if market_title:
+        triggers = tweet_analysis.get("mentions_market_trigger", [])
+        if any(t in market_title.lower() for t in triggers):
+            base += 15  # Direct relevance bonus
+    
+    return min(base + confidence_boost, 100)
+
+# ===== FRAMEWORK 3: NEWS SENTIMENT =====
+def news_framework_score(news_data, personality="Trump", market_title=""):
+    """Framework 3: News Sentiment (20% weight in combined)"""
+    if "error" in news_data or "articles" not in news_data:
+        return 50  # Neutral if no news
+    
+    articles = news_data["articles"][:10]
+    if not articles:
+        return 50
+    
+    pos_words = ['win', 'victory', 'success', 'gain', 'rise', 'surge', 'boost', 'strong', 'positive', 'breakthrough']
+    neg_words = ['loss', 'fall', 'crash', 'decline', 'trouble', 'crisis', 'scandal', 'investigation', 'indictment', 'guilty', 'fraud']
+    
+    total_score = 0
+    recent_count = 0
+    now = datetime.now()
+    
+    for article in articles:
+        text = f"{article.get('title','')} {article.get('description','')}".lower()
+        published = article.get("publishedAt", "")
+        
+        # Time decay — recent news matters more
+        try:
+            pub_time = datetime.fromisoformat(published.replace('Z', '+00:00'))
+            hours_ago = (now - pub_time.replace(tzinfo=None)).total_seconds() / 3600
+            time_weight = max(1 - (hours_ago / 24), 0.1)  # Decay over 24h
+        except:
+            time_weight = 0.5
+        
+        pos = sum(1 for w in pos_words if w in text)
+        neg = sum(1 for w in neg_words if w in text)
+        
+        if pos > neg:
+            article_score = 70
+        elif neg > pos:
+            article_score = 30
+        else:
+            article_score = 50
+        
+        total_score += article_score * time_weight
+        recent_count += time_weight
+    
+    if recent_count == 0:
+        return 50
+    
+    avg_score = total_score / recent_count
+    
+    # Boost if news directly mentions market topic
+    if market_title:
+        for article in articles[:5]:
+            text = f"{article.get('title','')} {article.get('description','')}".lower()
+            market_keywords = [w for w in market_title.lower().split() if len(w) > 3]
+            if any(kw in text for kw in market_keywords):
+                avg_score = min(avg_score + 10, 100)
+                break
+    
+    return avg_score
+
+# ===== FRAMEWORK 4: TIMING =====
+def timing_framework_score(m):
+    """Framework 4: Timing (10% weight in combined)"""
+    score = 50
+    
+    # Price proximity to 50/50 (more time = can be further from center)
+    uncertainty = 1 - abs(m["yes_price"] - 0.5) * 2
+    
+    # If price is near 50/50 with high volume = good timing (event soon)
+    if uncertainty > 0.7 and m["volume_24h"] > 50000:
+        score = 80
+    elif uncertainty > 0.5 and m["volume_24h"] > 20000:
+        score = 65
+    elif uncertainty < 0.3:
+        score = 35  # Too certain, low edge
+    
+    # Liquidity check — can you actually trade?
+    if m["liquidity"] < 10000:
+        score -= 20  # Hard to enter/exit
+    elif m["liquidity"] > 100000:
+        score += 10
+    
+    return max(min(score, 100), 0)
+
+# ===== COMBINED SIGNAL SCORE =====
+def combined_signal_score(market, tweet_analysis=None, news_data=None, personality="Trump"):
+    """
+    COMBINED SIGNAL SCORE (0-100)
+    
+    Framework weights:
+    - Market Data: 40% (objective market conditions)
+    - Personality/Behavioral: 30% (tweet analysis, behavioral patterns)
+    - News Sentiment: 20% (news velocity and sentiment)
+    - Timing: 10% (entry timing, liquidity)
+    """
+    
+    m_score = market_framework_score(market)
+    p_score = personality_framework_score(tweet_analysis, personality, market["title"])
+    n_score = news_framework_score(news_data, personality, market["title"])
+    t_score = timing_framework_score(market)
+    
+    combined = (m_score * 0.40) + (p_score * 0.30) + (n_score * 0.20) + (t_score * 0.10)
+    
+    return {
+        "combined": round(combined, 1),
+        "market": round(m_score, 1),
+        "personality": round(p_score, 1),
+        "news": round(n_score, 1),
+        "timing": round(t_score, 1),
+        "action": get_action(combined),
+        "position_pct": get_position_size(combined),
+        "confidence": get_confidence_level(combined)
+    }
+
+def get_action(score):
+    if score >= 75:
+        return "🟢 STRONG BUY"
+    elif score >= 60:
+        return "🟡 BUY"
+    elif score >= 45:
+        return "🟠 WATCH"
+    else:
+        return "🔴 SKIP"
+
+def get_position_size(score):
+    """Suggested position as % of bankroll"""
+    if score >= 85:
+        return 4.0
+    elif score >= 75:
+        return 3.0
+    elif score >= 65:
+        return 2.0
+    elif score >= 55:
+        return 1.0
+    elif score >= 45:
+        return 0.5
+    else:
+        return 0.0
+
+def get_confidence_level(score):
+    if score >= 80:
+        return "Very High"
+    elif score >= 65:
+        return "High"
+    elif score >= 50:
+        return "Medium"
+    else:
+        return "Low"
 
 # ===== SIDEBAR =====
 with st.sidebar:
@@ -324,13 +456,12 @@ with st.sidebar:
     min_liquidity = st.number_input("Min Liquidity ($)", 1000, 10000000, 5000, 1000)
     
     st.divider()
-    st.subheader("🔥 Hot Score Threshold")
-    hot_threshold = st.slider("Min Hot Score", 3.0, 10.0, 6.0, 0.5)
-    big_play_threshold = st.slider("Min Big Play Score", 3.0, 10.0, 6.5, 0.5)
+    st.subheader("🐦 Tweet Input (Optional)")
+    tweet_personality = st.selectbox("Personality", ["Trump", "Elon"])
+    tweet_input = st.text_area("Paste tweet:", height=80, placeholder="Paste tweet to include in signal...")
     
     st.divider()
-    st.subheader("📰 NewsAPI Key")
-    st.caption("Optional — adds news sentiment. Free key at newsapi.org")
+    st.subheader("📰 NewsAPI Key (Optional)")
     news_input = st.text_input("NewsAPI Key", type="password", value=NEWS_API_KEY or "")
     if news_input:
         NEWS_API_KEY = news_input
@@ -340,159 +471,150 @@ with st.sidebar:
         st.rerun()
 
 # ===== HEADER =====
-st.title("🎯 Polymarket Tracker — Trump & Elon Alpha")
-st.caption("Hot markets + personality-driven prediction + news sentiment")
+st.title("🎯 Polymarket Combined Signal Tracker")
+st.caption("4-Framework Signal Fusion: Market (40%) + Personality (30%) + News (20%) + Timing (10%)")
 st.divider()
 
-# ===== FETCH =====
-with st.spinner("Pulling live Polymarket data..."):
+# ===== FETCH DATA =====
+with st.spinner("Loading markets..."):
     raw = get_gamma_markets(limit=200, min_liquidity=min_liquidity)
     markets = [parse_market(m) for m in raw]
     markets = [m for m in markets if m["volume_24h"] >= min_volume]
-    
-    for m in markets:
-        m["hot_score"] = calc_hot_score(m)
-        m["big_play_score"] = calc_big_play_score(m)
 
 if not markets:
-    st.warning("No markets loaded. API may be rate-limited. Click Refresh.")
+    st.warning("No markets loaded. API may be rate-limited.")
     st.stop()
+
+# ===== FETCH NEWS (if key provided) =====
+news_data = None
+if NEWS_API_KEY:
+    with st.spinner("Fetching news..."):
+        query = "Donald Trump" if tweet_personality == "Trump" else "Elon Musk"
+        news_data = get_news(query, api_key=NEWS_API_KEY, page_size=15)
+
+# ===== PROCESS TWEET =====
+tweet_analysis = None
+if tweet_input.strip():
+    tweet_analysis = analyze_tweet(tweet_input, tweet_personality)
+
+# ===== CALCULATE COMBINED SCORES =====
+for m in markets:
+    m["scores"] = combined_signal_score(m, tweet_analysis, news_data, tweet_personality)
+
+# Sort by combined score
+markets.sort(key=lambda x: x["scores"]["combined"], reverse=True)
 
 # ===== KPIs =====
 total_vol = sum(m["volume_24h"] for m in markets)
-hot_count = len([m for m in markets if m["hot_score"] >= hot_threshold])
-big_play_count = len([m for m in markets if m["big_play_score"] >= big_play_threshold])
-uncertain_count = len([m for m in markets if 0.4 <= m["yes_price"] <= 0.6])
+strong_buy = len([m for m in markets if m["scores"]["combined"] >= 75])
+buy = len([m for m in markets if 60 <= m["scores"]["combined"] < 75])
+watch = len([m for m in markets if 45 <= m["scores"]["combined"] < 60])
 
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Markets Tracked", len(markets))
+k1.metric("Markets", len(markets))
 k2.metric("24h Volume", f"${total_vol:,.0f}")
-k3.metric("🔥 Hot", hot_count)
-k4.metric("⚡ Big Plays", big_play_count, delta=f"{uncertain_count} near 50/50")
+k3.metric("🟢 Strong Buy", strong_buy)
+k4.metric("🟡 Buy", buy, delta=f"{watch} watching")
 st.divider()
+
+# ===== TOP SIGNALS BANNER =====
+top_signals = [m for m in markets if m["scores"]["combined"] >= 60][:5]
+if top_signals:
+    st.subheader("🔥 Top Combined Signals Right Now")
+    cols = st.columns(min(len(top_signals), 5))
+    for i, m in enumerate(cols):
+        if i < len(top_signals):
+            market = top_signals[i]
+            score = market["scores"]["combined"]
+            action = market["scores"]["action"]
+            pos = (bankroll * market["scores"]["position_pct"] / 100)
+            
+            color = "green" if score >= 75 else "orange" if score >= 60 else "gray"
+            with m:
+                st.markdown(f"**{market['title'][:40]}...**")
+                st.markdown(f"### {score}/100")
+                st.markdown(f"**{action}**")
+                st.caption(f"Suggested: ${pos:,.0f}")
+                st.markdown(f"[Trade](https://polymarket.com/event/{market['slug']})")
+    st.divider()
 
 # ===== TABS =====
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "🔥 Hot Markets", "⚡ Big Plays", "🎯 Trump & Elon",
-    "🐦 Tweet Analyzer", "📰 News Sentiment", "🔮 Profiles"
+    "📊 Combined Signals", "🐦 Tweet Analyzer", "📰 News Sentiment",
+    "🔥 Hot Markets", "🎯 Trump & Elon", "🔮 Profiles"
 ])
 
-# ===== TAB 1: HOT MARKETS =====
+# ===== TAB 1: COMBINED SIGNALS =====
 with tab1:
-    st.subheader("🔥 Hot Markets Right Now")
-    st.caption("Volume velocity + uncertainty + liquidity")
+    st.subheader("📊 All Markets Ranked by Combined Signal Score")
+    st.caption("Sorted by combined score. Higher = stronger signal across all 4 frameworks.")
     
-    hot_markets = [m for m in markets if m["hot_score"] >= hot_threshold]
-    hot_markets.sort(key=lambda x: x["hot_score"], reverse=True)
+    filter_action = st.multiselect("Filter by action:", 
+                                   ["🟢 STRONG BUY", "🟡 BUY", "🟠 WATCH", "🔴 SKIP"],
+                                   default=["🟢 STRONG BUY", "🟡 BUY", "🟠 WATCH"])
     
-    if not hot_markets:
-        st.info("No hot markets. Lower threshold or check later.")
+    search = st.text_input("Search markets...", placeholder="type to filter...")
     
-    for m in hot_markets[:15]:
-        pos = (bankroll * 0.02) * (m["hot_score"] / 10)
-        velocity = (m["volume_24h"] / max(m["volume_total"], 1)) * 100
+    filtered = [m for m in markets if m["scores"]["action"] in filter_action]
+    if search:
+        filtered = [m for m in filtered if search.lower() in m["title"].lower()]
+    
+    for m in filtered[:30]:
+        s = m["scores"]
+        pos = (bankroll * s["position_pct"] / 100)
         
-        c1, c2, c3 = st.columns([1, 3, 1])
-        with c1:
-            emoji = "🔥🔥" if m["hot_score"] >= 8 else "🔥" if m["hot_score"] >= 6 else "⚡"
-            st.markdown(f"## {emoji}")
-            st.markdown(f"**{m['hot_score']:.1f}/10**")
-        with c2:
-            st.markdown(f"**{m['title']}**")
-            st.caption(f"Yes: {m['yes_price']:.1%} | 24h Vol: ${m['volume_24h']:,.0f} | Velocity: {velocity:.1f}%")
-        with c3:
-            st.markdown(f"**${pos:,.0f}** suggested")
-            st.markdown(f"[Trade](https://polymarket.com/event/{m['slug']})")
+        # Color code the expander
+        if s["combined"] >= 75:
+            status_color = "🟢"
+        elif s["combined"] >= 60:
+            status_color = "🟡"
+        elif s["combined"] >= 45:
+            status_color = "🟠"
+        else:
+            status_color = "🔴"
+        
+        with st.expander(f"{status_color} {s['combined']}/100 | {m['title'][:60]}... | {s['action']}"):
+            col1, col2, col3 = st.columns([2, 2, 1])
+            
+            with col1:
+                st.markdown(f"**{m['title']}**")
+                st.caption(f"Yes: {m['yes_price']:.1%} | 24h Vol: ${m['volume_24h']:,.0f} | Liq: ${m['liquidity']:,.0f}")
+                st.markdown(f"**Suggested Position:** ${pos:,.0f} ({s['position_pct']}% of bankroll)")
+                st.markdown(f"**Confidence:** {s['confidence']}")
+            
+            with col2:
+                st.markdown("**Framework Breakdown:**")
+                st.markdown(f"📊 Market Data: **{s['market']}/100**")
+                st.markdown(f"🧠 Personality: **{s['personality']}/100**")
+                st.markdown(f"📰 News: **{s['news']}/100**")
+                st.markdown(f"⏱️ Timing: **{s['timing']}/100**")
+            
+            with col3:
+                st.markdown(f"### {s['action']}")
+                st.markdown(f"[Trade Now](https://polymarket.com/event/{m['slug']})")
+            
+            # Signal meter
+            st.progress(s["combined"] / 100)
+            st.caption(f"Combined Signal: {s['combined']}/100")
+        
         st.divider()
 
-# ===== TAB 2: BIG PLAYS =====
+# ===== TAB 2: TWEET ANALYZER =====
 with tab2:
-    st.subheader("⚡ Potential Big Plays")
-    st.caption("High liquidity + near 50/50 + volume")
-    
-    big_plays = [m for m in markets if m["big_play_score"] >= big_play_threshold and m["volume_24h"] > 10000]
-    big_plays.sort(key=lambda x: x["big_play_score"], reverse=True)
-    
-    if not big_plays:
-        st.info("No big plays. Lower threshold or check later.")
-    
-    for m in big_plays[:15]:
-        pos = (bankroll * 0.03) * (m["big_play_score"] / 10)
-        uncertainty = 1 - abs(m["yes_price"] - 0.5) * 2
-        
-        c1, c2, c3 = st.columns([1, 3, 1])
-        with c1:
-            emoji = "💰" if m["big_play_score"] >= 8 else "⚡"
-            st.markdown(f"## {emoji}")
-            st.markdown(f"**{m['big_play_score']:.1f}/10**")
-        with c2:
-            st.markdown(f"**{m['title']}**")
-            st.caption(f"Uncertainty: {uncertainty:.0%} | Vol: ${m['volume_24h']:,.0f} | Liq: ${m['liquidity']:,.0f}")
-        with c3:
-            st.markdown(f"**${pos:,.0f}** suggested")
-            st.markdown(f"[Trade](https://polymarket.com/event/{m['slug']})")
-        st.divider()
-
-# ===== TAB 3: TRUMP & ELON =====
-with tab3:
-    st.subheader("🎯 Trump & Elon Markets")
-    
-    TRUMP_KEYWORDS = ["trump", "donald", "indictment", "trial", "court", "election", "biden", "kamala", "gop", "republican"]
-    ELON_KEYWORDS = ["elon", "musk", "tesla", "spacex", "dogecoin", "doge", "crypto", "bitcoin", "twitter", "x", "neuralink", "starlink", "mars", "ai"]
-    
-    trump_markets = [m for m in markets if any(kw in m["title"].lower() for kw in TRUMP_KEYWORDS)]
-    elon_markets = [m for m in markets if any(kw in m["title"].lower() for kw in ELON_KEYWORDS)]
-    trump_markets.sort(key=lambda x: x["hot_score"], reverse=True)
-    elon_markets.sort(key=lambda x: x["hot_score"], reverse=True)
-    
-    col_t, col_e = st.columns(2)
-    
-    with col_t:
-        st.markdown("### 🟥 Trump Markets")
-        if trump_markets:
-            for m in trump_markets[:8]:
-                st.markdown(f"**{m['title']}**")
-                st.caption(f"Yes: {m['yes_price']:.1%} | Vol: ${m['volume_24h']:,.0f} | Hot: {m['hot_score']:.1f}")
-                st.markdown(f"[Trade](https://polymarket.com/event/{m['slug']})")
-        else:
-            st.caption("No active Trump markets")
-    
-    with col_e:
-        st.markdown("### 🟦 Elon Markets")
-        if elon_markets:
-            for m in elon_markets[:8]:
-                st.markdown(f"**{m['title']}**")
-                st.caption(f"Yes: {m['yes_price']:.1%} | Vol: ${m['volume_24h']:,.0f} | Hot: {m['hot_score']:.1f}")
-                st.markdown(f"[Trade](https://polymarket.com/event/{m['slug']})")
-        else:
-            st.caption("No active Elon markets")
-    
-    st.divider()
-    combined = list({m['condition_id']: m for m in trump_markets + elon_markets}.values())
-    combined.sort(key=lambda x: x['hot_score'], reverse=True)
-    if combined:
-        st.subheader("📈 Combined Signal Feed")
-        for m in combined[:10]:
-            is_trump = any(kw in m["title"].lower() for kw in TRUMP_KEYWORDS)
-            badge = "🟥 TRUMP" if is_trump else "🟦 ELON"
-            st.markdown(f"{badge} **{m['title']}** — Yes: {m['yes_price']:.1%} | Hot: {m['hot_score']:.1f} | [Trade](https://polymarket.com/event/{m['slug']})")
-
-# ===== TAB 4: TWEET ANALYZER =====
-with tab4:
     st.subheader("🐦 Tweet Analyzer")
-    st.caption("Paste a tweet. We'll analyze it using personality profiles + behavioral gauges.")
+    st.caption("Paste a tweet. Analyzes using personality + behavioral + predictive models.")
     
-    personality_select = st.selectbox("Who tweeted this?", ["Trump", "Elon"])
-    tweet_input = st.text_area("Paste tweet text here:", height=150, placeholder="e.g. WITCH HUNT CONTINUES! THEY WON'T STOP!!!")
+    ta_personality = st.selectbox("Who tweeted?", ["Trump", "Elon"], key="ta_personality")
+    ta_tweet = st.text_area("Paste tweet:", height=150, placeholder="e.g. WITCH HUNT CONTINUES! BIG NEWS COMING!!!", key="ta_tweet")
     
-    if st.button("Analyze Tweet", type="primary") and tweet_input:
-        analysis = analyze_tweet(tweet_input, personality_select)
-        p = PERSONALITIES[personality_select]
+    if st.button("Analyze Tweet", type="primary", key="ta_button") and ta_tweet:
+        analysis = analyze_tweet(ta_tweet, ta_personality)
+        p = PERSONALITIES[ta_personality]
         
         st.divider()
         
         # Energy gauge
-        st.subheader("🔋 Energy Level Assessment")
+        st.subheader("🔋 Energy Level")
         energy = analysis["energy_level"]
         energy_desc = p["behavioral_gauge"].get(energy, "Unknown")
         
@@ -511,66 +633,52 @@ with tab4:
             for match in analysis["behavioral_match"]:
                 st.markdown(f"- ✅ {match}")
         else:
-            st.caption("No strong behavioral patterns detected")
+            st.caption("No strong patterns")
         
-        # Caps ratio
-        st.metric("CAPS Ratio", f"{analysis['caps_ratio']:.0%}", delta="Higher = more emotional")
+        st.metric("CAPS Ratio", f"{analysis['caps_ratio']:.0%}")
         
         # Market triggers
-        st.subheader("📊 Market Triggers Found")
+        st.subheader("📊 Market Triggers")
         if analysis["mentions_market_trigger"]:
-            st.markdown("**Keywords that could move markets:**")
+            st.markdown("**Keywords:**")
             for trigger in set(analysis["mentions_market_trigger"]):
                 st.markdown(f"- 🔥 `{trigger}`")
         else:
-            st.caption("No direct market trigger keywords found")
+            st.caption("No direct triggers")
         
-        # Predictive model
-        st.subheader("🔮 Predicted Market Impact")
-        impact_colors = {
-            "very_high": "red",
-            "high": "orange", 
-            "medium": "blue",
-            "low": "gray"
-        }
-        impact = analysis["predicted_market_impact"]
-        confidence = analysis["confidence"]
+        # Predictive
+        st.subheader("🔮 Predicted Impact")
+        st.markdown(f"**Impact:** {analysis['predicted_market_impact'].upper()} | **Confidence:** {analysis['confidence']}%")
         
-        st.markdown(f"**Impact Level:** {impact.upper()}")
-        st.markdown(f"**Confidence:** {confidence}%")
-        
-        # Show relevant predictions
-        st.subheader("📋 Based on Personality Model:")
+        # Show personality predictions
         pred_model = p["predictive_model"]
-        
         if analysis["has_nickname"] and "nickname" in str(pred_model):
             st.info(f"🎯 {pred_model.get('if_nickname_new', '')}")
         if analysis["has_deadline"] and "deadline" in str(pred_model):
             st.info(f"🎯 {pred_model.get('if_deadline_claim', '')}")
         if analysis["energy_level"] == "manic":
-            st.info(f"🎯 {pred_model.get('if_all_caps' if personality_select=='Trump' else 'if_meme_spam', '')}")
+            st.info(f"🎯 {pred_model.get('if_all_caps' if ta_personality=='Trump' else 'if_meme_spam', '')}")
         
-        # Suggested markets
-        st.subheader("📈 Related Markets to Watch")
-        related_keywords = set(analysis["mentions_market_trigger"])
-        related_markets = [m for m in markets if any(kw in m["title"].lower() for kw in related_keywords)]
-        related_markets.sort(key=lambda x: x["hot_score"], reverse=True)
-        
-        if related_markets:
-            for m in related_markets[:5]:
-                st.markdown(f"- **{m['title']}** — Yes: {m['yes_price']:.1%} | [Trade](https://polymarket.com/event/{m['slug']})")
+        # Related markets
+        st.subheader("📈 Related Markets")
+        related = [m for m in markets if any(t in m["title"].lower() for t in analysis.get("mentions_market_trigger", []))]
+        related.sort(key=lambda x: x["scores"]["combined"], reverse=True)
+        if related:
+            for m in related[:5]:
+                s = m["scores"]
+                st.markdown(f"- **{m['title']}** — Score: {s['combined']}/100 | {s['action']} | [Trade](https://polymarket.com/event/{m['slug']})")
         else:
-            st.caption("No directly related markets found. Check the 'Trump & Elon' tab for relevant markets.")
+            st.caption("No directly related markets. Check Combined Signals tab.")
 
-# ===== TAB 5: NEWS SENTIMENT =====
-with tab5:
+# ===== TAB 3: NEWS SENTIMENT =====
+with tab3:
     st.subheader("📰 News Sentiment Tracker")
     st.caption("Latest news on Trump and Elon — correlate with market movements")
     
-    news_personality = st.selectbox("Track news for:", ["Trump", "Elon"])
+    news_personality = st.selectbox("Track news for:", ["Trump", "Elon"], key="news_personality")
     
     if not NEWS_API_KEY:
-        st.warning("⚠️ No NewsAPI key. Get a free key at newsapi.org and add it in the sidebar or as a Render environment variable 'newsapi_key'")
+        st.warning("⚠️ No NewsAPI key. Get a free key at newsapi.org and add it as Render env var 'newsapi_key' or in sidebar")
     else:
         with st.spinner("Fetching latest news..."):
             query = "Donald Trump" if news_personality == "Trump" else "Elon Musk"
@@ -582,7 +690,6 @@ with tab5:
             articles = news_data["articles"]
             st.success(f"Found {len(articles)} articles")
             
-            # Show articles
             for article in articles:
                 title = article.get("title", "No title")
                 source = article.get("source", {}).get("name", "Unknown")
@@ -597,9 +704,8 @@ with tab5:
                     if url:
                         st.markdown(f"[Read full article]({url})")
                     
-                    # Simple sentiment heuristic
-                    pos_words = ['win', 'victory', 'success', 'gain', 'rise', 'surge', 'boost', 'strong', 'positive']
-                    neg_words = ['loss', 'fall', 'crash', 'decline', 'trouble', 'crisis', 'scandal', 'investigation', 'indictment']
+                    pos_words = ['win', 'victory', 'success', 'gain', 'rise', 'surge', 'boost', 'strong', 'positive', 'breakthrough']
+                    neg_words = ['loss', 'fall', 'crash', 'decline', 'trouble', 'crisis', 'scandal', 'investigation', 'indictment', 'guilty', 'fraud']
                     
                     text_to_check = f"{title} {description}".lower()
                     pos_count = sum(1 for w in pos_words if w in text_to_check)
@@ -612,21 +718,85 @@ with tab5:
                     else:
                         st.info("📊 Sentiment: Neutral")
             
-            # Correlation hint
             st.divider()
             st.subheader("📊 Market Correlation")
             st.caption("Check if any markets spiked after these news times")
             
+            TRUMP_KEYWORDS = ["trump", "donald", "indictment", "trial", "court", "election", "biden", "kamala", "gop", "republican"]
+            ELON_KEYWORDS = ["elon", "musk", "tesla", "spacex", "dogecoin", "doge", "crypto", "bitcoin", "twitter", "x", "neuralink", "starlink", "mars", "ai"]
             related_keywords = TRUMP_KEYWORDS if news_personality == "Trump" else ELON_KEYWORDS
             related_markets = [m for m in markets if any(kw in m["title"].lower() for kw in related_keywords)]
-            related_markets.sort(key=lambda x: x["volume_24h"], reverse=True)
+            related_markets.sort(key=lambda x: x["scores"]["combined"], reverse=True)
             
             if related_markets:
-                st.markdown("**Top related markets by volume:**")
+                st.markdown("**Top related markets by signal score:**")
                 for m in related_markets[:5]:
-                    st.markdown(f"- **{m['title']}** — Yes: {m['yes_price']:.1%} | 24h Vol: ${m['volume_24h']:,.0f} | [Trade](https://polymarket.com/event/{m['slug']})")
+                    s = m["scores"]
+                    st.markdown(f"- **{m['title']}** — Yes: {m['yes_price']:.1%} | Signal: {s['combined']}/100 | {s['action']} | [Trade](https://polymarket.com/event/{m['slug']})")
         else:
             st.warning("No articles found or API limit reached")
+
+# ===== TAB 4: HOT MARKETS =====
+with tab4:
+    st.subheader("🔥 Hot Markets")
+    st.caption("Markets ranked by volume velocity + uncertainty + liquidity")
+    
+    hot_markets = sorted(markets, key=lambda x: x["scores"]["market"], reverse=True)
+    
+    for m in hot_markets[:20]:
+        s = m["scores"]
+        pos = (bankroll * s["position_pct"] / 100)
+        velocity = (m["volume_24h"] / max(m["volume_total"], 1)) * 100
+        
+        c1, c2, c3 = st.columns([1, 3, 1])
+        with c1:
+            emoji = "🔥🔥" if s["market"] >= 80 else "🔥" if s["market"] >= 60 else "⚡"
+            st.markdown(f"## {emoji}")
+            st.markdown(f"**{s['market']:.0f}/100**")
+        with c2:
+            st.markdown(f"**{m['title']}**")
+            st.caption(f"Yes: {m['yes_price']:.1%} | 24h Vol: ${m['volume_24h']:,.0f} | Velocity: {velocity:.1f}%")
+            st.caption(f"Combined Signal: {s['combined']}/100 | {s['action']}")
+        with c3:
+            st.markdown(f"**${pos:,.0f}** suggested")
+            st.markdown(f"[Trade](https://polymarket.com/event/{m['slug']})")
+        st.divider()
+
+# ===== TAB 5: TRUMP & ELON =====
+with tab5:
+    st.subheader("🎯 Trump & Elon Markets")
+    
+    TRUMP_KEYWORDS = ["trump", "donald", "indictment", "trial", "court", "election", "biden", "kamala", "gop", "republican"]
+    ELON_KEYWORDS = ["elon", "musk", "tesla", "spacex", "dogecoin", "doge", "crypto", "bitcoin", "twitter", "x", "neuralink", "starlink", "mars", "ai"]
+    
+    trump_markets = [m for m in markets if any(kw in m["title"].lower() for kw in TRUMP_KEYWORDS)]
+    elon_markets = [m for m in markets if any(kw in m["title"].lower() for kw in ELON_KEYWORDS)]
+    trump_markets.sort(key=lambda x: x["scores"]["combined"], reverse=True)
+    elon_markets.sort(key=lambda x: x["scores"]["combined"], reverse=True)
+    
+    col_t, col_e = st.columns(2)
+    
+    with col_t:
+        st.markdown("### 🟥 Trump Markets")
+        if trump_markets:
+            for m in trump_markets[:8]:
+                s = m["scores"]
+                st.markdown(f"**{m['title']}**")
+                st.caption(f"Yes: {m['yes_price']:.1%} | Signal: {s['combined']}/100 | {s['action']}")
+                st.markdown(f"[Trade](https://polymarket.com/event/{m['slug']})")
+        else:
+            st.caption("No active Trump markets")
+    
+    with col_e:
+        st.markdown("### 🟦 Elon Markets")
+        if elon_markets:
+            for m in elon_markets[:8]:
+                s = m["scores"]
+                st.markdown(f"**{m['title']}**")
+                st.caption(f"Yes: {m['yes_price']:.1%} | Signal: {s['combined']}/100 | {s['action']}")
+                st.markdown(f"[Trade](https://polymarket.com/event/{m['slug']})")
+        else:
+            st.caption("No active Elon markets")
 
 # ===== TAB 6: PROFILES =====
 with tab6:
@@ -657,20 +827,24 @@ with tab6:
             st.markdown("**🎯 Market Triggers to Watch:**")
             triggers = ', '.join([f'`{t}`' for t in p['market_triggers'][:10]])
             st.markdown(triggers)
+    
+    st.divider()
+    st.subheader("📋 Combined Signal Methodology")
+    st.markdown("""
+    **How the Combined Signal Score works:**
+    
+    1. **Market Data Framework (40%)** — Volume velocity, liquidity depth, price uncertainty
+    2. **Personality Framework (30%)** — Tweet analysis, behavioral patterns, predictive models
+    3. **News Sentiment Framework (20%)** — Headline velocity, sentiment scoring, time decay
+    4. **Timing Framework (10%)** — Entry timing, liquidity for exit, resolution proximity
+    
+    **Actions:**
+    - 🟢 **STRONG BUY** (75-100): All frameworks align. High conviction.
+    - 🟡 **BUY** (60-74): Most frameworks positive. Good setup.
+    - 🟠 **WATCH** (45-59): Mixed signals. Wait for confirmation.
+    - 🔴 **SKIP** (0-44): Weak or conflicting signals.
+    """)
 
 # ===== FOOTER =====
 st.divider()
-st.caption(f"Last refresh: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} | Gamma + Data + CLOB + NewsAPI | Tweet Analyzer v1.0")
-
-# ===== TAB 6: PROFILES =====
-with tab6:
-    st.subheader("🔮 Personality & Communication Profiles")
-    
-    for name, p in PERSONALITIES.items():
-        with st.expander(f"🔮 {p['name']} — {p['western']} | {p['chinese']} | {p['numerology']}", expanded=(name=="Trump")):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown(f"**Element:** {p['element']}")
-                st.markdown("**Core Traits:**")
-                for trait in p['traits']:
-                    st
+st.caption(f"Last refresh: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} | Combined Signal v2.0 | 4-Framework Fusion")
